@@ -9,6 +9,10 @@
 (define-constant ERR_LOAN_OVERDUE (err u107))
 (define-constant ERR_ALREADY_MEMBER (err u108))
 (define-constant ERR_NOT_MEMBER (err u109))
+(define-constant ERR_INVALID_RATING (err u110))
+(define-constant ERR_ALREADY_RATED (err u111))
+(define-constant ERR_CANNOT_RATE_OWN_POOL (err u112))
+(define-constant ERR_MUST_HAVE_INTERACTED (err u113))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var next-loan-id uint u1)
@@ -51,6 +55,55 @@
 (define-map user-pool-memberships
   { user: principal, pool-id: uint }
   { is-member: bool }
+)
+
+(define-map pool-ratings
+  { pool-id: uint, rater: principal }
+  { 
+    rating: uint,
+    review: (string-ascii 200),
+    rated-at: uint,
+    interaction-type: (string-ascii 20)
+  }
+)
+
+(define-map pool-rating-summary
+  { pool-id: uint }
+  {
+    total-ratings: uint,
+    total-score: uint,
+    average-rating: uint,
+    five-star: uint,
+    four-star: uint,
+    three-star: uint,
+    two-star: uint,
+    one-star: uint
+  }
+)
+
+(define-map creator-reputation
+  { creator: principal }
+  {
+    total-pools: uint,
+    total-ratings: uint,
+    total-score: uint,
+    average-rating: uint,
+    successful-loans: uint,
+    total-volume: uint,
+    reputation-score: uint
+  }
+)
+
+(define-map user-interactions
+  { user: principal, pool-id: uint }
+  {
+    has-borrowed: bool,
+    has-contributed: bool,
+    loans-count: uint,
+    total-borrowed: uint,
+    total-contributed: uint,
+    last-interaction: uint
+  }
 )
 
 (define-public (create-lending-pool 
@@ -113,6 +166,17 @@
       { user: tx-sender, pool-id: pool-id }
       { is-member: true }
     )
+    (map-set user-interactions
+      { user: tx-sender, pool-id: pool-id }
+      { 
+        has-borrowed: false,
+        has-contributed: true,
+        loans-count: u0,
+        total-borrowed: u0,
+        total-contributed: contribution,
+        last-interaction: stacks-block-height
+      }
+    )
     (ok true)
   )
 )
@@ -149,6 +213,30 @@
       (merge pool {
         available-funds: (- (get available-funds pool) amount)
       })
+    )
+    (let ((existing-interaction (map-get? user-interactions { user: tx-sender, pool-id: pool-id })))
+      (match existing-interaction
+        interaction (map-set user-interactions
+          { user: tx-sender, pool-id: pool-id }
+          (merge interaction {
+            has-borrowed: true,
+            loans-count: (+ (get loans-count interaction) u1),
+            total-borrowed: (+ (get total-borrowed interaction) amount),
+            last-interaction: stacks-block-height
+          })
+        )
+        (map-set user-interactions
+          { user: tx-sender, pool-id: pool-id }
+          {
+            has-borrowed: true,
+            has-contributed: false,
+            loans-count: u1,
+            total-borrowed: amount,
+            total-contributed: u0,
+            last-interaction: stacks-block-height
+          }
+        )
+      )
     )
     (var-set next-loan-id (+ loan-id u1))
     (ok loan-id)
@@ -207,6 +295,115 @@
   )
 )
 
+(define-public (rate-pool (pool-id uint) (rating uint) (review (string-ascii 200)))
+  (let ((pool (unwrap! (map-get? lending-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+        (interaction (map-get? user-interactions { user: tx-sender, pool-id: pool-id }))
+        (existing-rating (map-get? pool-ratings { pool-id: pool-id, rater: tx-sender })))
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (not (is-eq tx-sender (get creator pool))) ERR_CANNOT_RATE_OWN_POOL)
+    (asserts! (is-none existing-rating) ERR_ALREADY_RATED)
+    (asserts! (is-some interaction) ERR_MUST_HAVE_INTERACTED)
+    (let ((user-interaction (unwrap! interaction ERR_MUST_HAVE_INTERACTED)))
+      (asserts! (or (get has-borrowed user-interaction) (get has-contributed user-interaction)) ERR_MUST_HAVE_INTERACTED)
+      (map-set pool-ratings
+        { pool-id: pool-id, rater: tx-sender }
+        {
+          rating: rating,
+          review: review,
+          rated-at: stacks-block-height,
+          interaction-type: (if (get has-borrowed user-interaction) "borrower" "contributor")
+        }
+      )
+      (begin
+        (unwrap! (update-pool-rating-summary pool-id rating) ERR_UNAUTHORIZED)
+        (unwrap! (update-creator-reputation (get creator pool) rating) ERR_UNAUTHORIZED)
+        (ok true)
+      )
+    )
+  )
+)
+
+(define-private (update-pool-rating-summary (pool-id uint) (new-rating uint))
+  (let ((current-summary (default-to 
+          { total-ratings: u0, total-score: u0, average-rating: u0, 
+            five-star: u0, four-star: u0, three-star: u0, two-star: u0, one-star: u0 }
+          (map-get? pool-rating-summary { pool-id: pool-id })))
+        (new-total-ratings (+ (get total-ratings current-summary) u1))
+        (new-total-score (+ (get total-score current-summary) new-rating))
+        (new-average (/ new-total-score new-total-ratings)))
+    (map-set pool-rating-summary
+      { pool-id: pool-id }
+      (merge current-summary {
+        total-ratings: new-total-ratings,
+        total-score: new-total-score,
+        average-rating: new-average,
+        five-star: (+ (get five-star current-summary) (if (is-eq new-rating u5) u1 u0)),
+        four-star: (+ (get four-star current-summary) (if (is-eq new-rating u4) u1 u0)),
+        three-star: (+ (get three-star current-summary) (if (is-eq new-rating u3) u1 u0)),
+        two-star: (+ (get two-star current-summary) (if (is-eq new-rating u2) u1 u0)),
+        one-star: (+ (get one-star current-summary) (if (is-eq new-rating u1) u1 u0))
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-creator-reputation (creator principal) (new-rating uint))
+  (let ((current-rep (default-to 
+          { total-pools: u0, total-ratings: u0, total-score: u0, average-rating: u0,
+            successful-loans: u0, total-volume: u0, reputation-score: u0 }
+          (map-get? creator-reputation { creator: creator })))
+        (new-total-ratings (+ (get total-ratings current-rep) u1))
+        (new-total-score (+ (get total-score current-rep) new-rating))
+        (new-average (/ new-total-score new-total-ratings))
+        (base-score (/ (* new-average u20) u1))
+        (volume-bonus (/ (get total-volume current-rep) u1000000))
+        (loan-bonus (/ (get successful-loans current-rep) u10))
+        (new-reputation-score (+ base-score volume-bonus loan-bonus)))
+    (map-set creator-reputation
+      { creator: creator }
+      (merge current-rep {
+        total-ratings: new-total-ratings,
+        total-score: new-total-score,
+        average-rating: new-average,
+        reputation-score: new-reputation-score
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-creator-pool-count (creator principal))
+  (let ((current-rep (default-to 
+          { total-pools: u0, total-ratings: u0, total-score: u0, average-rating: u0,
+            successful-loans: u0, total-volume: u0, reputation-score: u0 }
+          (map-get? creator-reputation { creator: creator }))))
+    (map-set creator-reputation
+      { creator: creator }
+      (merge current-rep {
+        total-pools: (+ (get total-pools current-rep) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-successful-loan (creator principal) (loan-amount uint))
+  (let ((current-rep (default-to 
+          { total-pools: u0, total-ratings: u0, total-score: u0, average-rating: u0,
+            successful-loans: u0, total-volume: u0, reputation-score: u0 }
+          (map-get? creator-reputation { creator: creator }))))
+    (map-set creator-reputation
+      { creator: creator }
+      (merge current-rep {
+        successful-loans: (+ (get successful-loans current-rep) u1),
+        total-volume: (+ (get total-volume current-rep) loan-amount)
+      })
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-pool-info (pool-id uint))
   (map-get? lending-pools { pool-id: pool-id })
 )
@@ -242,5 +439,99 @@
   (match (map-get? loans { loan-id: loan-id })
     loan (and (not (get is-repaid loan)) (> stacks-block-height (get due-date loan)))
     false
+  )
+)
+
+(define-read-only (get-pool-rating-summary (pool-id uint))
+  (map-get? pool-rating-summary { pool-id: pool-id })
+)
+
+(define-read-only (get-user-pool-rating (pool-id uint) (user principal))
+  (map-get? pool-ratings { pool-id: pool-id, rater: user })
+)
+
+(define-read-only (get-creator-reputation (creator principal))
+  (map-get? creator-reputation { creator: creator })
+)
+
+(define-read-only (get-user-interaction (user principal) (pool-id uint))
+  (map-get? user-interactions { user: user, pool-id: pool-id })
+)
+
+(define-read-only (can-rate-pool (pool-id uint) (user principal))
+  (let ((pool (map-get? lending-pools { pool-id: pool-id }))
+        (interaction (map-get? user-interactions { user: user, pool-id: pool-id }))
+        (existing-rating (map-get? pool-ratings { pool-id: pool-id, rater: user })))
+    (match pool
+      pool-data (and 
+        (not (is-eq user (get creator pool-data)))
+        (is-some interaction)
+        (is-none existing-rating)
+        (match interaction
+          user-interaction (or (get has-borrowed user-interaction) (get has-contributed user-interaction))
+          false
+        )
+      )
+      false
+    )
+  )
+)
+
+(define-read-only (get-pool-ratings-list (pool-id uint) (limit uint) (offset uint))
+  (let ((max-limit (if (> limit u50) u50 limit)))
+    {
+      pool-id: pool-id,
+      limit: max-limit,
+      offset: offset,
+      summary: (map-get? pool-rating-summary { pool-id: pool-id })
+    }
+  )
+)
+
+(define-read-only (get-top-rated-pools (limit uint))
+  (let ((max-limit (if (> limit u20) u20 limit)))
+    {
+      limit: max-limit,
+      total-pools: (- (var-get next-pool-id) u1)
+    }
+  )
+)
+
+(define-read-only (get-creator-stats (creator principal))
+  (let ((reputation (map-get? creator-reputation { creator: creator })))
+    (match reputation
+      rep-data {
+        creator: creator,
+        total-pools: (get total-pools rep-data),
+        average-rating: (get average-rating rep-data),
+        total-ratings: (get total-ratings rep-data),
+        successful-loans: (get successful-loans rep-data),
+        total-volume: (get total-volume rep-data),
+        reputation-score: (get reputation-score rep-data),
+        reputation-level: (get-reputation-level (get reputation-score rep-data))
+      }
+      {
+        creator: creator,
+        total-pools: u0,
+        average-rating: u0,
+        total-ratings: u0,
+        successful-loans: u0,
+        total-volume: u0,
+        reputation-score: u0,
+        reputation-level: "newcomer"
+      }
+    )
+  )
+)
+
+(define-read-only (get-reputation-level (score uint))
+  (if (>= score u80) "legendary"
+    (if (>= score u60) "expert"
+      (if (>= score u40) "trusted"
+        (if (>= score u20) "established"
+          "newcomer"
+        )
+      )
+    )
   )
 )
