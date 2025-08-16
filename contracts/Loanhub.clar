@@ -13,9 +13,17 @@
 (define-constant ERR_ALREADY_RATED (err u111))
 (define-constant ERR_CANNOT_RATE_OWN_POOL (err u112))
 (define-constant ERR_MUST_HAVE_INTERACTED (err u113))
+(define-constant ERR_AUCTION_NOT_FOUND (err u114))
+(define-constant ERR_AUCTION_EXPIRED (err u115))
+(define-constant ERR_AUCTION_STILL_ACTIVE (err u116))
+(define-constant ERR_BID_TOO_HIGH (err u117))
+(define-constant ERR_INSUFFICIENT_BID_AMOUNT (err u118))
+(define-constant ERR_CANNOT_BID_ON_OWN_AUCTION (err u119))
+(define-constant ERR_AUCTION_ALREADY_FINALIZED (err u120))
 
 (define-data-var next-pool-id uint u1)
 (define-data-var next-loan-id uint u1)
+(define-data-var next-auction-id uint u1)
 
 (define-map lending-pools
   { pool-id: uint }
@@ -104,6 +112,38 @@
     total-contributed: uint,
     last-interaction: uint
   }
+)
+
+(define-map loan-auctions
+  { auction-id: uint }
+  {
+    pool-id: uint,
+    borrower: principal,
+    amount: uint,
+    max-interest-rate: uint,
+    collateral: uint,
+    auction-duration: uint,
+    created-at: uint,
+    ends-at: uint,
+    is-finalized: bool,
+    winning-bidder: (optional principal),
+    winning-rate: (optional uint),
+    loan-id: (optional uint)
+  }
+)
+
+(define-map auction-bids
+  { auction-id: uint, bidder: principal }
+  {
+    interest-rate: uint,
+    bid-amount: uint,
+    placed-at: uint
+  }
+)
+
+(define-map auction-bid-count
+  { auction-id: uint }
+  { count: uint }
 )
 
 (define-public (create-lending-pool 
@@ -292,6 +332,149 @@
       })
     )
     (ok true)
+  )
+)
+
+(define-public (create-loan-auction 
+  (pool-id uint) 
+  (amount uint) 
+  (max-interest-rate uint) 
+  (collateral uint) 
+  (auction-duration uint))
+  (let ((pool (unwrap! (map-get? lending-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+        (auction-id (var-get next-auction-id))
+        (membership (map-get? user-pool-memberships { user: tx-sender, pool-id: pool-id })))
+    (asserts! (get is-active pool) ERR_POOL_INACTIVE)
+    (asserts! (is-some membership) ERR_NOT_MEMBER)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= amount (get max-loan-amount pool)) ERR_INVALID_AMOUNT)
+    (asserts! (> max-interest-rate u0) ERR_INVALID_AMOUNT)
+    (asserts! (> auction-duration u0) ERR_INVALID_AMOUNT)
+    (if (> collateral u0)
+      (try! (stx-transfer? collateral tx-sender (as-contract tx-sender)))
+      true)
+    (map-set loan-auctions
+      { auction-id: auction-id }
+      {
+        pool-id: pool-id,
+        borrower: tx-sender,
+        amount: amount,
+        max-interest-rate: max-interest-rate,
+        collateral: collateral,
+        auction-duration: auction-duration,
+        created-at: stacks-block-height,
+        ends-at: (+ stacks-block-height auction-duration),
+        is-finalized: false,
+        winning-bidder: none,
+        winning-rate: none,
+        loan-id: none
+      }
+    )
+    (map-set auction-bid-count
+      { auction-id: auction-id }
+      { count: u0 }
+    )
+    (var-set next-auction-id (+ auction-id u1))
+    (ok auction-id)
+  )
+)
+
+(define-public (place-auction-bid (auction-id uint) (interest-rate uint))
+  (let ((auction (unwrap! (map-get? loan-auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND))
+        (pool (unwrap! (map-get? lending-pools { pool-id: (get pool-id auction) }) ERR_POOL_NOT_FOUND))
+        (membership (map-get? user-pool-memberships { user: tx-sender, pool-id: (get pool-id auction) }))
+        (member-info (map-get? pool-members { pool-id: (get pool-id auction), member: tx-sender }))
+        (bid-count-info (default-to { count: u0 } (map-get? auction-bid-count { auction-id: auction-id }))))
+    (asserts! (is-some membership) ERR_NOT_MEMBER)
+    (asserts! (not (is-eq tx-sender (get borrower auction))) ERR_CANNOT_BID_ON_OWN_AUCTION)
+    (asserts! (not (get is-finalized auction)) ERR_AUCTION_ALREADY_FINALIZED)
+    (asserts! (<= stacks-block-height (get ends-at auction)) ERR_AUCTION_EXPIRED)
+    (asserts! (> interest-rate u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= interest-rate (get max-interest-rate auction)) ERR_BID_TOO_HIGH)
+    (let ((required-funds (get amount auction))
+          (member-contribution (match member-info some-info (get contribution some-info) u0)))
+      (asserts! (>= member-contribution required-funds) ERR_INSUFFICIENT_BID_AMOUNT)
+      (map-set auction-bids
+        { auction-id: auction-id, bidder: tx-sender }
+        {
+          interest-rate: interest-rate,
+          bid-amount: required-funds,
+          placed-at: stacks-block-height
+        }
+      )
+      (map-set auction-bid-count
+        { auction-id: auction-id }
+        { count: (+ (get count bid-count-info) u1) }
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-public (finalize-auction (auction-id uint))
+  (let ((auction (unwrap! (map-get? loan-auctions { auction-id: auction-id }) ERR_AUCTION_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get borrower auction)) ERR_UNAUTHORIZED)
+    (asserts! (not (get is-finalized auction)) ERR_AUCTION_ALREADY_FINALIZED)
+    (asserts! (> stacks-block-height (get ends-at auction)) ERR_AUCTION_STILL_ACTIVE)
+    (let ((winning-bid (get-best-bid auction-id)))
+      (match winning-bid
+        best-bid (let ((loan-id (var-get next-loan-id))
+                       (pool (unwrap! (map-get? lending-pools { pool-id: (get pool-id auction) }) ERR_POOL_NOT_FOUND)))
+          (asserts! (<= (get amount auction) (get available-funds pool)) ERR_INSUFFICIENT_FUNDS)
+          (try! (as-contract (stx-transfer? (get amount auction) tx-sender (get borrower auction))))
+          (map-set loans
+            { loan-id: loan-id }
+            {
+              pool-id: (get pool-id auction),
+              borrower: (get borrower auction),
+              amount: (get amount auction),
+              interest-rate: (get interest-rate best-bid),
+              issued-at: stacks-block-height,
+              due-date: (+ stacks-block-height (get loan-duration pool)),
+              repaid-amount: u0,
+              is-repaid: false,
+              collateral: (get collateral auction)
+            }
+          )
+          (map-set lending-pools
+            { pool-id: (get pool-id auction) }
+            (merge pool {
+              available-funds: (- (get available-funds pool) (get amount auction))
+            })
+          )
+          (map-set loan-auctions
+            { auction-id: auction-id }
+            (merge auction {
+              is-finalized: true,
+              winning-bidder: (some (get bidder best-bid)),
+              winning-rate: (some (get interest-rate best-bid)),
+              loan-id: (some loan-id)
+            })
+          )
+          (var-set next-loan-id (+ loan-id u1))
+          (ok loan-id)
+        )
+        (begin
+          (if (> (get collateral auction) u0)
+            (try! (as-contract (stx-transfer? (get collateral auction) tx-sender (get borrower auction))))
+            true)
+          (map-set loan-auctions
+            { auction-id: auction-id }
+            (merge auction { is-finalized: true })
+          )
+          (ok u0)
+        )
+      )
+    )
+  )
+)
+
+(define-private (get-best-bid (auction-id uint))
+  (let ((bid-count-info (default-to { count: u0 } (map-get? auction-bid-count { auction-id: auction-id }))))
+    (if (> (get count bid-count-info) u0)
+      (some { bidder: tx-sender, interest-rate: u1, bid-amount: u0, placed-at: u0 })
+      none
+    )
   )
 )
 
@@ -535,3 +718,34 @@
     )
   )
 )
+
+(define-read-only (get-auction-info (auction-id uint))
+  (map-get? loan-auctions { auction-id: auction-id })
+)
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal))
+  (map-get? auction-bids { auction-id: auction-id, bidder: bidder })
+)
+
+(define-read-only (get-auction-bid-count (auction-id uint))
+  (default-to { count: u0 } (map-get? auction-bid-count { auction-id: auction-id }))
+)
+
+(define-read-only (get-total-auctions)
+  (- (var-get next-auction-id) u1)
+)
+
+(define-read-only (is-auction-active (auction-id uint))
+  (match (map-get? loan-auctions { auction-id: auction-id })
+    auction (and (not (get is-finalized auction)) (<= stacks-block-height (get ends-at auction)))
+    false
+  )
+)
+
+(define-read-only (is-auction-expired (auction-id uint))
+  (match (map-get? loan-auctions { auction-id: auction-id })
+    auction (and (not (get is-finalized auction)) (> stacks-block-height (get ends-at auction)))
+    false
+  )
+)
+
